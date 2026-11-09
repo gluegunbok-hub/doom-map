@@ -79,6 +79,7 @@
 
   <div class="row">
     <button id="connect" class="primary">CONNECT</button>
+    <button id="gpsBtn">START GPS</button>
   </div>
   <div class="row">
     <button id="zoomOut">ZOOM &minus;</button>
@@ -167,7 +168,7 @@
     return Math.hypot(ax + t * vx, ay + t * vy);
   }
 
-  // ------------------------------------------------------------------
+  // -----------------------------------------------------------------
   //  Roads from OpenStreetMap (Overpass API)
   // -----------------------------------------------------------------
   function roadClass(h) {
@@ -401,9 +402,23 @@
   // -----------------------------------------------------------------
   //  GPS + screen wake
   // ------------------------------------------------------------------
-  function startGps() {
+  function gpsError(err) {
+    const msg = {
+      1: 'Location blocked. iPhone Settings > Bluefy > Location > While Using, Precise on. Then tap START GPS.',
+      2: 'No GPS signal yet. Go near a window or outside.',
+      3: 'Still searching for GPS...',
+    }[err.code] || err.message;
+    $('sGps').innerHTML = '<span class="warn">' + (err.code === 1 ? 'blocked' : err.code === 3 ? 'searching...' : 'no signal') + '</span>';
+    log(msg);
+  }
+
+  function startGps(fromTap) {
+    if (!navigator.geolocation) { $('sGps').textContent = 'not available'; log('This browser has no location access.'); return; }
+    if (fromTap && gpsWatch != null) { navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null; }
     if (gpsWatch != null) return;
-    if (!navigator.geolocation) { $('sGps').textContent = 'not available'; return; }
+    $('sGps').textContent = 'searching...';
+    // A direct one-off request (from a button tap) makes iOS show the permission prompt
+    navigator.geolocation.getCurrentPosition(() => {}, gpsError, { enableHighAccuracy: true, timeout: 30000 });
     gpsWatch = navigator.geolocation.watchPosition(p => {
       const c = p.coords;
       const here = { lat: c.latitude, lon: c.longitude };
@@ -414,9 +429,7 @@
       pos = here;
       $('sGps').textContent = `±${Math.round(c.accuracy)} m`;
       maybeFetchRoads();
-    }, err => {
-      $('sGps').innerHTML = '<span class="warn">' + err.message + '</span>';
-    }, { enableHighAccuracy: true, maximumAge: 2000, timeout: 30000 });
+    }, gpsError, { enableHighAccuracy: true, maximumAge: 2000, timeout: 30000 });
   }
 
   async function keepAwake() {
@@ -427,13 +440,14 @@
     if (document.visibilityState === 'visible' && device) keepAwake();
   });
 
-  // -----------------------------------------------------------------
+  // ------------------------------------------------------------------
   //  Controls + main loop
   // ------------------------------------------------------------------
   function showZoom() {
     $('sZoom').textContent = `${Math.round(ZOOMS[zoomIdx] * W)} m across`;
   }
   $('connect').onclick = () => connect(false);
+  $('gpsBtn').onclick = () => startGps(true);
   $('showAll').onclick = e => { e.preventDefault(); connect(true); };
   $('zoomIn').onclick = () => { zoomIdx = Math.max(0, zoomIdx - 1); showZoom(); maybeFetchRoads(); };
   $('zoomOut').onclick = () => { zoomIdx = Math.min(ZOOMS.length - 1, zoomIdx + 1); showZoom(); maybeFetchRoads(); };
