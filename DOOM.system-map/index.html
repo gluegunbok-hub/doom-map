@@ -73,7 +73,7 @@
 </head>
 <body>
   <h1>DOOM.system // MAP LINK</h1>
-  <p class="sub">Streams the roads around you to your device.</p>
+  <p class="sub">Streams the roads around you to your device. &middot; page v5</p>
 
   <div class="screen"><canvas id="preview" width="128" height="64"></canvas></div>
 
@@ -94,6 +94,7 @@
     <div><span>SCALE</span><span id="sZoom">&mdash;</span></div>
     <div><span>STREET</span><span id="sStreet">&mdash;</span></div>
     <div><span>SENT</span><span id="sSent">&mdash;</span></div>
+    <div><span>DIAG</span><span id="sDiag">checking...</span></div>
   </div>
   <div class="log" id="log"></div>
 
@@ -168,9 +169,9 @@
     return Math.hypot(ax + t * vx, ay + t * vy);
   }
 
-  // -----------------------------------------------------------------
+  // ------------------------------------------------------------------
   //  Roads from OpenStreetMap (Overpass API)
-  // -----------------------------------------------------------------
+  // ------------------------------------------------------------------
   function roadClass(h) {
     if (/^(motorway|trunk|primary|secondary)(_link)?$/.test(h)) return 3;
     if (/^(tertiary(_link)?|residential|unclassified|living_street)$/.test(h)) return 2;
@@ -213,9 +214,9 @@
     }
   }
 
-  // -----------------------------------------------------------------
+  // ------------------------------------------------------------------
   //  Rendering: white roads on black, player marker in the middle
-  // -----------------------------------------------------------------
+  // ------------------------------------------------------------------
   const LINE_W = [1, 1, 2, 3];
 
   function render() {
@@ -307,9 +308,9 @@
     return best.slice(0, 22);
   }
 
-  // -----------------------------------------------------------------
+  // ------------------------------------------------------------------
   //  Bluetooth
-  // -----------------------------------------------------------------
+  // ------------------------------------------------------------------
   const write = (chr, data) =>
     chr.writeValueWithResponse ? chr.writeValueWithResponse(data) : chr.writeValue(data);
 
@@ -399,7 +400,7 @@
     }
   }
 
-  // -----------------------------------------------------------------
+  // ------------------------------------------------------------------
   //  GPS + screen wake
   // ------------------------------------------------------------------
   function gpsError(err) {
@@ -415,27 +416,40 @@
 
   let gpsAsks = 0, gpsAnswered = false;
 
+  // Some in-app browsers never answer the permissions query, so give up after 1.5 s
   async function permissionState() {
     try {
-      if (!navigator.permissions) return 'unknown';
-      return (await navigator.permissions.query({ name: 'geolocation' })).state;   // granted / denied / prompt
-    } catch (e) { return 'unknown'; }
+      if (!navigator.permissions || !navigator.permissions.query) return 'n/a';
+      return await Promise.race([
+        navigator.permissions.query({ name: 'geolocation' }).then(r => r.state),   // granted / denied / prompt
+        new Promise(r => setTimeout(() => r('no reply'), 1500)),
+      ]);
+    } catch (e) { return 'n/a'; }
   }
 
-  async function startGps(fromTap) {
+  async function showDiag() {
+    const geo = 'geolocation' in navigator ? 'yes' : 'NO';
+    const bt = navigator.bluetooth ? 'yes' : 'NO';
+    const secure = window.isSecureContext ? 'yes' : 'NO';
+    $('sDiag').textContent = `geo ${geo} · bt ${bt} · https ${secure} · perm ${await permissionState()}`;
+  }
+
+  function startGps(fromTap) {
+    // React immediately so a tap is always visible
+    gpsAsks++;
+    const ask = gpsAsks;
+    if (fromTap) {
+      $('gpsBtn').textContent = 'REQUESTING... #' + ask;
+      setTimeout(() => { $('gpsBtn').textContent = 'START GPS'; }, 2500);
+    }
+    $('sGps').textContent = 'asking phone... #' + ask;
     if (!navigator.geolocation) { $('sGps').textContent = 'not available'; log('This browser has no location access.'); return; }
     if (fromTap && gpsWatch != null) { navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null; }
     if (gpsWatch != null) return;
-    gpsAsks++;
     gpsAnswered = false;
-    const ask = gpsAsks;
-    const perm = await permissionState();
-    $('sGps').textContent = 'asking phone... #' + ask;
-    if (fromTap) {
-      $('gpsBtn').textContent = 'REQUESTING...';
-      setTimeout(() => { $('gpsBtn').textContent = 'START GPS'; }, 2000);
-    }
-    log('Asked the phone for location (permission: ' + perm + '). Waiting for an answer...');
+    let perm = '?';
+    permissionState().then(p => { perm = p; showDiag(); });
+    log('Asked the phone for location (#' + ask + '). Waiting for an answer...');
     // If iOS never answers, Bluefy almost certainly has no location permission
     setTimeout(() => {
       if (!gpsAnswered && ask === gpsAsks && !pos) {
@@ -487,6 +501,7 @@
   };
   $('heading').textContent = 'NORTH UP';
   showZoom();
+  showDiag();
 
   setInterval(() => {
     render();
