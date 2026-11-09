@@ -92,6 +92,7 @@
     <div><span>ROADS</span><span id="sRoads">&mdash;</span></div>
     <div><span>SCALE</span><span id="sZoom">&mdash;</span></div>
     <div><span>STREET</span><span id="sStreet">&mdash;</span></div>
+    <div><span>SENT</span><span id="sSent">&mdash;</span></div>
   </div>
   <div class="log" id="log"></div>
 
@@ -118,7 +119,7 @@
   let device = null, imgChr = null, infoChr = null;
   let pos = null, prevPos = null, heading = null;
   let roads = [], roadsArea = null, fetching = false, fetchBlockedUntil = 0;
-  let sending = false, lastFrame = null, lastSentAt = 0, lastInfo = null;
+  let sending = false, lastFrame = null, lastSentAt = 0, lastInfo = null, framesSent = 0;
   let wakeLock = null, gpsWatch = null;
 
   const $ = id => document.getElementById(id);
@@ -168,7 +169,7 @@
 
   // ------------------------------------------------------------------
   //  Roads from OpenStreetMap (Overpass API)
-  // ------------------------------------------------------------------
+  // -----------------------------------------------------------------
   function roadClass(h) {
     if (/^(motorway|trunk|primary|secondary)(_link)?$/.test(h)) return 3;
     if (/^(tertiary(_link)?|residential|unclassified|living_street)$/.test(h)) return 2;
@@ -211,15 +212,22 @@
     }
   }
 
-  // ------------------------------------------------------------------
+  // -----------------------------------------------------------------
   //  Rendering: white roads on black, player marker in the middle
-  // ------------------------------------------------------------------
+  // -----------------------------------------------------------------
   const LINE_W = [1, 1, 2, 3];
 
   function render() {
     dctx.fillStyle = '#000';
     dctx.fillRect(0, 0, W, H);
-    if (!pos) return;
+    if (!pos) {                     // no GPS fix yet: just a pulsing ring in the middle
+      dctx.strokeStyle = '#fff';
+      dctx.lineWidth = 1;
+      dctx.beginPath();
+      dctx.arc(W / 2, H / 2, 3 + (Date.now() / 1000 % 2 < 1 ? 0 : 4), 0, Math.PI * 2);
+      dctx.stroke();
+      return;
+    }
 
     dctx.strokeStyle = '#fff';
     dctx.lineCap = 'round';
@@ -298,9 +306,9 @@
     return best.slice(0, 22);
   }
 
-  // ------------------------------------------------------------------
+  // -----------------------------------------------------------------
   //  Bluetooth
-  // ------------------------------------------------------------------
+  // -----------------------------------------------------------------
   const write = (chr, data) =>
     chr.writeValueWithResponse ? chr.writeValueWithResponse(data) : chr.writeValue(data);
 
@@ -324,7 +332,10 @@
       }
       lastFrame = bytes;
       lastSentAt = Date.now();
+      framesSent++;
+      $('sSent').textContent = framesSent + ' frames';
     } catch (err) {
+      $('sSent').innerHTML = '<span class="warn">send failed</span>';
       log('Send failed: ' + err.message);
     } finally {
       sending = false;
@@ -378,7 +389,7 @@
       });
       setDevice('connecting...', false);
       await gattConnect();
-      log('Connected. Walk around!');
+      log('Connected. Waiting for GPS - allow location access if asked.');
       startGps();
       keepAwake();
     } catch (err) {
@@ -387,7 +398,7 @@
     }
   }
 
-  // ------------------------------------------------------------------
+  // -----------------------------------------------------------------
   //  GPS + screen wake
   // ------------------------------------------------------------------
   function startGps() {
@@ -399,6 +410,7 @@
       if (c.heading != null && !isNaN(c.heading) && (c.speed || 0) > 0.6) heading = c.heading;
       else if (prevPos && metres(prevPos, here) > 6) heading = bearing(prevPos, here);
       if (!prevPos || metres(prevPos, here) > 6) prevPos = here;
+      if (!pos) log('GPS fix received. Walk around!');
       pos = here;
       $('sGps').textContent = `±${Math.round(c.accuracy)} m`;
       maybeFetchRoads();
@@ -415,7 +427,7 @@
     if (document.visibilityState === 'visible' && device) keepAwake();
   });
 
-  // ------------------------------------------------------------------
+  // -----------------------------------------------------------------
   //  Controls + main loop
   // ------------------------------------------------------------------
   function showZoom() {
@@ -438,7 +450,9 @@
     const frame = packFrame();
     const street = nearestStreet();
     $('sStreet').textContent = street || '—';
-    if (pos) { sendFrame(frame); sendInfo(street); }
+    // Always send, even before the first GPS fix, so the device shows the link is alive
+    sendFrame(frame);
+    sendInfo(pos ? street : 'WAITING FOR GPS');
   }, 1000);
 })();
 </script>
