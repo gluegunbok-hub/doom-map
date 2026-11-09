@@ -66,68 +66,82 @@
   .status span:last-child { text-align: right; overflow-wrap: anywhere; }
   .warn { color: var(--warn); }
   .log { margin-top: 10px; color: var(--dim); font-size: 12px; min-height: 1.4em; overflow-wrap: anywhere; }
+  .nokey {
+    display: none;
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 6px;
+    padding: 12px;
+    margin-bottom: 14px;
+    font-size: 14px;
+  }
   .help { color: var(--dim); font-size: 12px; margin-top: 18px; }
   .help b { color: var(--text); font-weight: 600; }
+  .help ol { padding-left: 20px; margin: 6px 0 12px; }
   a { color: var(--text); }
 </style>
 </head>
 <body>
   <h1>DOOM.system // MAP LINK</h1>
-  <p class="sub">Streams the roads around you to your device. &middot; page v5</p>
+  <p class="sub">Streams the roads around you to your device &middot; page v6</p>
+
+  <div class="nokey" id="nokey">
+    This page needs your personal key. Open the <b>MAP</b> screen on DOOM.system
+    and scan its QR code with your iPhone camera.
+  </div>
 
   <div class="screen"><canvas id="preview" width="128" height="64"></canvas></div>
 
   <div class="row">
-    <button id="connect" class="primary">CONNECT</button>
-    <button id="gpsBtn">START GPS</button>
+    <button id="start" class="primary">START</button>
   </div>
   <div class="row">
     <button id="zoomOut">ZOOM &minus;</button>
     <button id="zoomIn">ZOOM +</button>
-    <button id="heading">HEADING UP</button>
+    <button id="heading">NORTH UP</button>
   </div>
 
   <div class="status">
-    <div><span>DEVICE</span><span id="sDev">not connected</span></div>
-    <div><span>GPS</span><span id="sGps">waiting</span></div>
+    <div><span>RELAY</span><span id="sRelay">off</span></div>
+    <div><span>DEVICE</span><span id="sDev">&mdash;</span></div>
+    <div><span>GPS</span><span id="sGps">off</span></div>
     <div><span>ROADS</span><span id="sRoads">&mdash;</span></div>
     <div><span>SCALE</span><span id="sZoom">&mdash;</span></div>
     <div><span>STREET</span><span id="sStreet">&mdash;</span></div>
     <div><span>SENT</span><span id="sSent">&mdash;</span></div>
-    <div><span>DIAG</span><span id="sDiag">checking...</span></div>
   </div>
   <div class="log" id="log"></div>
 
-  <p class="help">
-    <b>How to use:</b> open this page in the <b>Bluefy</b> app (Safari can't do Bluetooth),
-    pair DOOM.system in iPhone Settings first, then tap CONNECT and pick DOOM.system.
-    Allow location access. Keep this page open with the screen on while walking.<br><br>
-    Can't see the device? <a href="#" id="showAll">Show all Bluetooth devices</a>.<br><br>
+  <div class="help">
+    <b>How to use (Safari):</b>
+    <ol>
+      <li>Turn on <b>Personal Hotspot</b> with <b>Maximize Compatibility</b> on.</li>
+      <li>On DOOM.system open <b>MAP</b>. It joins your hotspot and shows <b>READY</b>.</li>
+      <li>Tap <b>START</b> here and allow location.</li>
+      <li>Keep this page open with the screen on while you walk.</li>
+    </ol>
+    Map pictures are encrypted with your personal key before they leave the phone.<br><br>
     Map data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors.
-  </p>
+  </div>
 
 <script>
 (() => {
-  // Must match ble_phone.h on the device
-  const SVC  = '6e3a0001-d00d-4b1e-9f00-7d00d5a5e001';
-  const IMG  = '6e3a0002-d00d-4b1e-9f00-7d00d5a5e001';
-  const INFO = '6e3a0003-d00d-4b1e-9f00-7d00d5a5e001';
-
+  const BROKER = 'wss://broker.hivemq.com:8884/mqtt';
   const W = 128, H = 64;
   const ZOOMS = [1.5, 3, 6, 12];          // metres per pixel
   let zoomIdx = 1;
   let headingUp = false;
 
-  let device = null, imgChr = null, infoChr = null;
   let pos = null, prevPos = null, heading = null;
   let roads = [], roadsArea = null, fetching = false, fetchBlockedUntil = 0;
-  let sending = false, lastFrame = null, lastSentAt = 0, lastInfo = null, framesSent = 0;
-  let wakeLock = null, gpsWatch = null;
+  let lastFrame = null, lastSentAt = 0, framesSent = 0, sending = false;
+  let wakeLock = null, gpsWatch = null, gpsAsks = 0, gpsAnswered = false;
+  let aesKey = null, mapTopic = '', ackTopic = '';
+  let lastAckAt = 0, lastAckFrames = -1, ackFramesRising = false, ackBadKey = false;
 
   const $ = id => document.getElementById(id);
   const log = m => { $('log').textContent = m; };
 
-  // Offscreen 128x64 render target + 1-bit output
   const draw = document.createElement('canvas'); draw.width = W; draw.height = H;
   const dctx = draw.getContext('2d', { willReadFrequently: true });
   const bw = document.createElement('canvas'); bw.width = W; bw.height = H;
@@ -136,20 +150,173 @@
   prev.imageSmoothingEnabled = false;
 
   // ------------------------------------------------------------------
+  //  Personal key (from the QR link) -> AES key + relay topic
+  // ------------------------------------------------------------------
+  const hexBytes = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
+  const bytesHex = b => [...b].map(x => x.toString(16).padStart(2, '0')).join('');
+
+  function loadKeyHex() {
+    const m = location.hash.match(/k=([0-9a-fA-F]{32})/);
+    if (m) {
+      try { localStorage.setItem('doomKey', m[1].toLowerCase()); } catch (e) {}
+      return m[1].toLowerCase();
+    }
+    try { return localStorage.getItem('doomKey'); } catch (e) { return null; }
+  }
+
+  async function setupKey() {
+    const hex = loadKeyHex();
+    if (!hex) { $('nokey').style.display = 'block'; $('start').disabled = true; return false; }
+    const raw = hexBytes(hex);
+    aesKey = await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['encrypt']);
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', raw));
+    const id = bytesHex(digest.slice(0, 8));
+    mapTopic = `doomsys/${id}/map`;
+    ackTopic = `doomsys/${id}/ack`;
+    return true;
+  }
+
+  async function encryptFrame(bmp, info) {
+    const infoB = new TextEncoder().encode(info || '').slice(0, 40);
+    const plain = new Uint8Array(1026 + infoB.length);
+    plain[0] = 1;
+    plain.set(bmp, 1);
+    plain[1025] = infoB.length;
+    plain.set(infoB, 1026);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plain));
+    const out = new Uint8Array(12 + ct.length);   // IV | ciphertext | tag
+    out.set(iv, 0);
+    out.set(ct, 12);
+    return out;
+  }
+
+  // ------------------------------------------------------------------
+  //  Minimal MQTT-over-WebSocket client
+  // ------------------------------------------------------------------
+  const mqttLen = n => { const o = []; do { let b = n % 128; n = Math.floor(n / 128); if (n) b |= 128; o.push(b); } while (n); return o; };
+  const mqttStr = s => { const e = new TextEncoder().encode(s); return [e.length >> 8, e.length & 255, ...e]; };
+
+  const relay = {
+    ws: null, buf: new Uint8Array(0), connected: false, want: false, pinger: null,
+    start() { this.want = true; if (!this.ws) this.open(); },
+    open() {
+      setRelay('connecting...', false);
+      let ws;
+      try { ws = new WebSocket(BROKER, ['mqtt']); } catch (e) { setRelay('error', false); return; }
+      this.ws = ws;
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => {
+        const cid = 'doompage-' + Math.random().toString(16).slice(2, 10);
+        const vh = [0, 4, 77, 81, 84, 84, 4, 2, 0, 60, ...mqttStr(cid)];
+        this.send([0x10, ...mqttLen(vh.length), ...vh]);
+      };
+      ws.onmessage = e => this.feed(new Uint8Array(e.data));
+      ws.onclose = () => {
+        this.connected = false;
+        this.ws = null;
+        clearInterval(this.pinger);
+        setRelay('reconnecting...', false);
+        if (this.want) setTimeout(() => { if (!this.ws) this.open(); }, 3000);
+      };
+      ws.onerror = () => {};
+    },
+    send(bytes) {
+      if (this.ws && this.ws.readyState === 1) this.ws.send(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+    },
+    feed(chunk) {
+      const merged = new Uint8Array(this.buf.length + chunk.length);
+      merged.set(this.buf, 0); merged.set(chunk, this.buf.length);
+      let b = merged, i = 0;
+      while (true) {
+        if (b.length - i < 2) break;
+        let rl = 0, mul = 1, k = i + 1, byte;
+        do {
+          if (k >= b.length) { rl = -1; break; }
+          byte = b[k++]; rl += (byte & 127) * mul; mul *= 128;
+        } while (byte & 128);
+        if (rl < 0 || k + rl > b.length) break;
+        this.handle(b[i], b.subarray(k, k + rl));
+        i = k + rl;
+      }
+      this.buf = b.slice(i);
+    },
+    handle(h, body) {
+      const t = h & 0xF0;
+      if (t === 0x20) {
+        if (body[1] === 0) {
+          this.connected = true;
+          setRelay('connected', true);
+          const v = [0, 1, ...mqttStr(ackTopic), 0];
+          this.send([0x82, ...mqttLen(v.length), ...v]);
+          clearInterval(this.pinger);
+          this.pinger = setInterval(() => this.send([0xC0, 0]), 30000);
+        } else {
+          setRelay('refused (' + body[1] + ')', false);
+        }
+      } else if (t === 0x30) {
+        const tl = (body[0] << 8) | body[1];
+        let p = 2 + tl;
+        if (h & 6) p += 2;
+        const topic = new TextDecoder().decode(body.subarray(2, 2 + tl));
+        if (topic === ackTopic) onAck(new TextDecoder().decode(body.subarray(p)));
+      }
+    },
+    publish(topic, payload) {
+      if (!this.connected || this.ws.bufferedAmount > 16000) return false;
+      const t = mqttStr(topic);
+      const hdr = [0x30, ...mqttLen(t.length + payload.length)];
+      const out = new Uint8Array(hdr.length + t.length + payload.length);
+      out.set(hdr, 0); out.set(t, hdr.length); out.set(payload, hdr.length + t.length);
+      this.ws.send(out);
+      return true;
+    },
+  };
+
+  function setRelay(text, ok) {
+    $('sRelay').textContent = text;
+    $('sRelay').className = ok ? '' : 'warn';
+  }
+
+  // The device answers on the ack topic every few seconds: "ok <framesReceived>[ badkey]"
+  function onAck(msg) {
+    const m = msg.match(/^ok (\d+)( badkey)?/);
+    if (!m) return;
+    const n = parseInt(m[1], 10);
+    ackFramesRising = lastAckFrames >= 0 && n > lastAckFrames;
+    lastAckFrames = n;
+    ackBadKey = !!m[2];
+    lastAckAt = Date.now();
+  }
+
+  function showDevice() {
+    const el = $('sDev');
+    if (!relay.connected) { el.textContent = '—'; el.className = ''; return; }
+    if (Date.now() - lastAckAt > 10000) {
+      el.textContent = 'not seen - open MAP on the device';
+      el.className = 'warn';
+    } else if (ackBadKey) {
+      el.textContent = 'wrong key - rescan the QR code';
+      el.className = 'warn';
+    } else {
+      el.textContent = ackFramesRising ? `receiving (${lastAckFrames})` : 'online';
+      el.className = '';
+    }
+  }
+
+  // ------------------------------------------------------------------
   //  Geometry helpers
   // ------------------------------------------------------------------
   const R = Math.PI / 180;
-  function metres(a, b) {          // equirectangular distance in metres
+  function metres(a, b) {
     const k = Math.cos(((a.lat + b.lat) / 2) * R);
-    const dx = (b.lon - a.lon) * 111320 * k, dy = (b.lat - a.lat) * 110540;
-    return Math.hypot(dx, dy);
+    return Math.hypot((b.lon - a.lon) * 111320 * k, (b.lat - a.lat) * 110540);
   }
   function bearing(a, b) {
     const k = Math.cos(((a.lat + b.lat) / 2) * R);
-    const dx = (b.lon - a.lon) * k, dy = b.lat - a.lat;
-    return (Math.atan2(dx, dy) / R + 360) % 360;
+    return (Math.atan2((b.lon - a.lon) * k, b.lat - a.lat) / R + 360) % 360;
   }
-  function project(lat, lon) {     // -> screen pixels, player in the centre
+  function project(lat, lon) {
     const k = Math.cos(pos.lat * R), mpp = ZOOMS[zoomIdx];
     let dx = (lon - pos.lon) * 111320 * k / mpp;
     let dy = -(lat - pos.lat) * 110540 / mpp;
@@ -159,7 +326,7 @@
     }
     return [W / 2 + dx, H / 2 + dy];
   }
-  function segDist(p, a, b) {      // metres from point p to segment a-b
+  function segDist(p, a, b) {
     const k = Math.cos(p.lat * R);
     const ax = (a[1] - p.lon) * 111320 * k, ay = (a[0] - p.lat) * 110540;
     const bx = (b[1] - p.lon) * 111320 * k, by = (b[0] - p.lat) * 110540;
@@ -176,7 +343,7 @@
     if (/^(motorway|trunk|primary|secondary)(_link)?$/.test(h)) return 3;
     if (/^(tertiary(_link)?|residential|unclassified|living_street)$/.test(h)) return 2;
     if (/^(service|track|road|busway)$/.test(h)) return 1;
-    return 0;                       // footway, path, cycleway, steps, pedestrian ...
+    return 0;
   }
   const wantedRadius = () => Math.min(1500, Math.max(350, ZOOMS[zoomIdx] * W * 1.2));
 
@@ -215,14 +382,14 @@
   }
 
   // ------------------------------------------------------------------
-  //  Rendering: white roads on black, player marker in the middle
+  //  Rendering
   // ------------------------------------------------------------------
   const LINE_W = [1, 1, 2, 3];
 
   function render() {
     dctx.fillStyle = '#000';
     dctx.fillRect(0, 0, W, H);
-    if (!pos) {                     // no GPS fix yet: just a pulsing ring in the middle
+    if (!pos) {
       dctx.strokeStyle = '#fff';
       dctx.lineWidth = 1;
       dctx.beginPath();
@@ -230,14 +397,13 @@
       dctx.stroke();
       return;
     }
-
     dctx.strokeStyle = '#fff';
     dctx.lineCap = 'round';
     dctx.lineJoin = 'round';
     const mpp = ZOOMS[zoomIdx];
-    for (const cls of [0, 1, 2, 3]) {           // small roads first, big on top
-      if (cls === 0 && mpp > 1.5) continue;     // footpaths only at the closest zoom
-      if (cls === 1 && mpp >= 6) continue;      // service roads hidden when zoomed out
+    for (const cls of [0, 1, 2, 3]) {
+      if (cls === 0 && mpp > 1.5) continue;
+      if (cls === 1 && mpp >= 6) continue;
       dctx.lineWidth = LINE_W[cls];
       dctx.setLineDash(cls === 0 ? [2, 2] : []);
       dctx.beginPath();
@@ -252,7 +418,6 @@
     }
     dctx.setLineDash([]);
 
-    // Player marker: black halo then white arrow (or ring if no heading)
     const cx = W / 2, cy = H / 2;
     dctx.fillStyle = '#000';
     dctx.beginPath(); dctx.arc(cx, cy, 6, 0, Math.PI * 2); dctx.fill();
@@ -297,7 +462,7 @@
 
   function nearestStreet() {
     if (!pos) return '';
-    let best = '', bestD = 40;                    // within 40 m
+    let best = '', bestD = 40;
     for (const rd of roads) {
       if (!rd.name) continue;
       for (let i = 1; i < rd.pts.length; i++) {
@@ -308,95 +473,28 @@
     return best.slice(0, 22);
   }
 
-  // ------------------------------------------------------------------
-  //  Bluetooth
-  // ------------------------------------------------------------------
-  const write = (chr, data) =>
-    chr.writeValueWithResponse ? chr.writeValueWithResponse(data) : chr.writeValue(data);
-
   function framesEqual(a, b) {
     if (!a || !b) return false;
     for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
     return true;
   }
 
-  async function sendFrame(bytes) {
-    if (!imgChr || sending) return;
-    // Resend at least every 5 s so the device knows we're still here
+  async function sendFrame(bytes, info) {
+    if (!relay.connected || sending) return;
     if (framesEqual(bytes, lastFrame) && Date.now() - lastSentAt < 5000) return;
     sending = true;
     try {
-      for (let i = 0; i < 8; i++) {
-        const chunk = new Uint8Array(130);
-        chunk[0] = i; chunk[1] = 8;
-        chunk.set(bytes.subarray(i * 128, (i + 1) * 128), 2);
-        await write(imgChr, chunk);
+      const payload = await encryptFrame(bytes, info);
+      if (relay.publish(mapTopic, payload)) {
+        lastFrame = bytes;
+        lastSentAt = Date.now();
+        framesSent++;
+        $('sSent').textContent = framesSent + ' frames';
       }
-      lastFrame = bytes;
-      lastSentAt = Date.now();
-      framesSent++;
-      $('sSent').textContent = framesSent + ' frames';
     } catch (err) {
-      $('sSent').innerHTML = '<span class="warn">send failed</span>';
       log('Send failed: ' + err.message);
     } finally {
       sending = false;
-    }
-  }
-
-  async function sendInfo(text) {
-    if (!infoChr || text === lastInfo) return;
-    try {
-      await write(infoChr, new TextEncoder().encode(text || ' '));
-      lastInfo = text;
-    } catch (err) { /* try again next tick */ }
-  }
-
-  function setDevice(text, ok) {
-    $('sDev').textContent = text;
-    $('sDev').className = ok ? '' : 'warn';
-    $('connect').textContent = ok ? 'CONNECTED' : 'CONNECT';
-    $('connect').disabled = ok;
-  }
-
-  async function gattConnect() {
-    const server = await device.gatt.connect();
-    const svc = await server.getPrimaryService(SVC);
-    imgChr = await svc.getCharacteristic(IMG);
-    infoChr = await svc.getCharacteristic(INFO);
-    lastFrame = null; lastInfo = null;
-    setDevice(device.name || 'DOOM.system', true);
-  }
-
-  async function reconnectLoop() {
-    while (device && !device.gatt.connected) {
-      try { await gattConnect(); log('Reconnected.'); return; }
-      catch (err) { await new Promise(r => setTimeout(r, 3000)); }
-    }
-  }
-
-  async function connect(showAll) {
-    if (!navigator.bluetooth) {
-      log('Bluetooth is not available here. Open this page in the Bluefy app.');
-      return;
-    }
-    try {
-      device = await navigator.bluetooth.requestDevice(showAll
-        ? { acceptAllDevices: true, optionalServices: [SVC] }
-        : { filters: [{ services: [SVC] }, { namePrefix: 'DOOM' }], optionalServices: [SVC] });
-      device.addEventListener('gattserverdisconnected', () => {
-        imgChr = infoChr = null;
-        setDevice('reconnecting...', false);
-        reconnectLoop();
-      });
-      setDevice('connecting...', false);
-      await gattConnect();
-      log('Connected. Waiting for GPS - allow location access if asked.');
-      startGps();
-      keepAwake();
-    } catch (err) {
-      setDevice('not connected', false);
-      log('Connect failed: ' + err.message);
     }
   }
 
@@ -406,7 +504,7 @@
   function gpsError(err) {
     gpsAnswered = true;
     const msg = {
-      1: 'Location blocked. iPhone Settings > Bluefy > Location > While Using, Precise on. Then tap START GPS.',
+      1: 'Location blocked. iPhone Settings > Privacy & Security > Location Services > Safari Websites > While Using the App. Then tap START.',
       2: 'No GPS signal yet. Go near a window or outside.',
       3: 'Still searching for GPS...',
     }[err.code] || err.message;
@@ -414,52 +512,19 @@
     log(msg);
   }
 
-  let gpsAsks = 0, gpsAnswered = false;
-
-  // Some in-app browsers never answer the permissions query, so give up after 1.5 s
-  async function permissionState() {
-    try {
-      if (!navigator.permissions || !navigator.permissions.query) return 'n/a';
-      return await Promise.race([
-        navigator.permissions.query({ name: 'geolocation' }).then(r => r.state),   // granted / denied / prompt
-        new Promise(r => setTimeout(() => r('no reply'), 1500)),
-      ]);
-    } catch (e) { return 'n/a'; }
-  }
-
-  async function showDiag() {
-    const geo = 'geolocation' in navigator ? 'yes' : 'NO';
-    const bt = navigator.bluetooth ? 'yes' : 'NO';
-    const secure = window.isSecureContext ? 'yes' : 'NO';
-    $('sDiag').textContent = `geo ${geo} · bt ${bt} · https ${secure} · perm ${await permissionState()}`;
-  }
-
-  function startGps(fromTap) {
-    // React immediately so a tap is always visible
+  function startGps() {
     gpsAsks++;
     const ask = gpsAsks;
-    if (fromTap) {
-      $('gpsBtn').textContent = 'REQUESTING... #' + ask;
-      setTimeout(() => { $('gpsBtn').textContent = 'START GPS'; }, 2500);
-    }
     $('sGps').textContent = 'asking phone... #' + ask;
-    if (!navigator.geolocation) { $('sGps').textContent = 'not available'; log('This browser has no location access.'); return; }
-    if (fromTap && gpsWatch != null) { navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null; }
-    if (gpsWatch != null) return;
+    if (!navigator.geolocation) { $('sGps').textContent = 'not available'; return; }
+    if (gpsWatch != null) { navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null; }
     gpsAnswered = false;
-    let perm = '?';
-    permissionState().then(p => { perm = p; showDiag(); });
-    log('Asked the phone for location (#' + ask + '). Waiting for an answer...');
-    // If iOS never answers, Bluefy almost certainly has no location permission
     setTimeout(() => {
       if (!gpsAnswered && ask === gpsAsks && !pos) {
         $('sGps').innerHTML = '<span class="warn">no answer</span>';
-        log('No answer from location (permission: ' + perm + '). iPhone Settings > Privacy & Security > ' +
-            'Location Services: ON, then Bluefy > While Using the App + Precise Location. ' +
-            'Then close Bluefy completely (swipe it away) and open it again.');
+        log('No answer from location. Check Settings > Privacy & Security > Location Services is ON, then tap START again.');
       }
     }, 12000);
-    // A direct one-off request (from a button tap) makes iOS show the permission prompt
     navigator.geolocation.getCurrentPosition(() => {}, gpsError, { enableHighAccuracy: true, timeout: 30000 });
     gpsWatch = navigator.geolocation.watchPosition(p => {
       gpsAnswered = true;
@@ -477,10 +542,10 @@
 
   async function keepAwake() {
     try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); }
-    catch (err) { /* not supported - keep the screen on manually */ }
+    catch (err) { /* keep the screen on manually */ }
   }
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && device) keepAwake();
+    if (document.visibilityState === 'visible' && relay.want) keepAwake();
   });
 
   // ------------------------------------------------------------------
@@ -489,9 +554,14 @@
   function showZoom() {
     $('sZoom').textContent = `${Math.round(ZOOMS[zoomIdx] * W)} m across`;
   }
-  $('connect').onclick = () => connect(false);
-  $('gpsBtn').onclick = () => startGps(true);
-  $('showAll').onclick = e => { e.preventDefault(); connect(true); };
+  $('start').onclick = () => {
+    $('start').textContent = 'RUNNING';
+    $('start').classList.remove('primary');
+    startGps();          // straight from the tap, so iOS shows the location prompt
+    relay.start();
+    keepAwake();
+    log('Started. Allow location if asked.');
+  };
   $('zoomIn').onclick = () => { zoomIdx = Math.max(0, zoomIdx - 1); showZoom(); maybeFetchRoads(); };
   $('zoomOut').onclick = () => { zoomIdx = Math.min(ZOOMS.length - 1, zoomIdx + 1); showZoom(); maybeFetchRoads(); };
   $('heading').onclick = () => {
@@ -499,18 +569,18 @@
     $('heading').classList.toggle('on', headingUp);
     $('heading').textContent = headingUp ? 'HEADING UP' : 'NORTH UP';
   };
-  $('heading').textContent = 'NORTH UP';
   showZoom();
-  showDiag();
+
+  setupKey().then(ok => { if (ok) log('Key loaded. Tap START.'); })
+            .catch(err => log('Key problem: ' + err.message));
 
   setInterval(() => {
     render();
     const frame = packFrame();
     const street = nearestStreet();
     $('sStreet').textContent = street || '—';
-    // Always send, even before the first GPS fix, so the device shows the link is alive
-    sendFrame(frame);
-    sendInfo(pos ? street : 'WAITING FOR GPS');
+    showDevice();
+    sendFrame(frame, pos ? street : 'WAITING FOR GPS');
   }, 1000);
 })();
 </script>
