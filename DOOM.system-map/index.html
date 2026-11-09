@@ -403,6 +403,7 @@
   //  GPS + screen wake
   // ------------------------------------------------------------------
   function gpsError(err) {
+    gpsAnswered = true;
     const msg = {
       1: 'Location blocked. iPhone Settings > Bluefy > Location > While Using, Precise on. Then tap START GPS.',
       2: 'No GPS signal yet. Go near a window or outside.',
@@ -412,14 +413,42 @@
     log(msg);
   }
 
-  function startGps(fromTap) {
+  let gpsAsks = 0, gpsAnswered = false;
+
+  async function permissionState() {
+    try {
+      if (!navigator.permissions) return 'unknown';
+      return (await navigator.permissions.query({ name: 'geolocation' })).state;   // granted / denied / prompt
+    } catch (e) { return 'unknown'; }
+  }
+
+  async function startGps(fromTap) {
     if (!navigator.geolocation) { $('sGps').textContent = 'not available'; log('This browser has no location access.'); return; }
     if (fromTap && gpsWatch != null) { navigator.geolocation.clearWatch(gpsWatch); gpsWatch = null; }
     if (gpsWatch != null) return;
-    $('sGps').textContent = 'searching...';
+    gpsAsks++;
+    gpsAnswered = false;
+    const ask = gpsAsks;
+    const perm = await permissionState();
+    $('sGps').textContent = 'asking phone... #' + ask;
+    if (fromTap) {
+      $('gpsBtn').textContent = 'REQUESTING...';
+      setTimeout(() => { $('gpsBtn').textContent = 'START GPS'; }, 2000);
+    }
+    log('Asked the phone for location (permission: ' + perm + '). Waiting for an answer...');
+    // If iOS never answers, Bluefy almost certainly has no location permission
+    setTimeout(() => {
+      if (!gpsAnswered && ask === gpsAsks && !pos) {
+        $('sGps').innerHTML = '<span class="warn">no answer</span>';
+        log('No answer from location (permission: ' + perm + '). iPhone Settings > Privacy & Security > ' +
+            'Location Services: ON, then Bluefy > While Using the App + Precise Location. ' +
+            'Then close Bluefy completely (swipe it away) and open it again.');
+      }
+    }, 12000);
     // A direct one-off request (from a button tap) makes iOS show the permission prompt
     navigator.geolocation.getCurrentPosition(() => {}, gpsError, { enableHighAccuracy: true, timeout: 30000 });
     gpsWatch = navigator.geolocation.watchPosition(p => {
+      gpsAnswered = true;
       const c = p.coords;
       const here = { lat: c.latitude, lon: c.longitude };
       if (c.heading != null && !isNaN(c.heading) && (c.speed || 0) > 0.6) heading = c.heading;
