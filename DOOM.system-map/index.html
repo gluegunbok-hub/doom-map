@@ -83,7 +83,7 @@
 </head>
 <body>
   <h1>DOOM.system // MAP LINK</h1>
-  <p class="sub">Streams the roads around you to your device &middot; page v6</p>
+  <p class="sub">Streams the roads around you to your device &middot; page v7</p>
 
   <div class="nokey" id="nokey">
     This page needs your personal key. Open the <b>MAP</b> screen on DOOM.system
@@ -176,13 +176,20 @@
     return true;
   }
 
+  // Frame v2: version | bitmap(1024) | infoLen | info | lat*1e5 | lon*1e5 (int32 LE)
+  // The location is rounded to 0.01 deg (~1 km) - only used for the weather.
   async function encryptFrame(bmp, info) {
     const infoB = new TextEncoder().encode(info || '').slice(0, 40);
-    const plain = new Uint8Array(1026 + infoB.length);
-    plain[0] = 1;
+    const plain = new Uint8Array(1026 + infoB.length + 8);
+    plain[0] = 2;
     plain.set(bmp, 1);
     plain[1025] = infoB.length;
     plain.set(infoB, 1026);
+    if (pos) {
+      const dv = new DataView(plain.buffer, 1026 + infoB.length, 8);
+      dv.setInt32(0, Math.round(pos.lat * 100) * 1000, true);
+      dv.setInt32(4, Math.round(pos.lon * 100) * 1000, true);
+    }
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, aesKey, plain));
     const out = new Uint8Array(12 + ct.length);   // IV | ciphertext | tag
